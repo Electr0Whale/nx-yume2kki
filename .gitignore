@@ -1,0 +1,28 @@
+# Build directories
+build/
+dist/
+out/
+nca/
+package/
+
+# Keys (STRICTLY PROHIBITED TO COMMIT)
+keys/
+*.keys
+*.dat
+
+# Large binaries & archives
+*.nsp
+*.nro
+*.elf
+*.nso
+*.zip
+*.7z
+*.tar.gz
+
+# System & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+.vscode/
+.idea/

@@ -1,0 +1,1302 @@
+diff -urN vendor/easyrpg-player-0.8.1.1/CMakeLists.txt work/src/easyrpg-player-0.8.1.1/CMakeLists.txt
+--- vendor/easyrpg-player-0.8.1.1/CMakeLists.txt	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/CMakeLists.txt	2026-11-03 04:11:17.749681400 +0800
+@@ -310,6 +310,8 @@
+ 	src/scene_import.h
+ 	src/scene_item.cpp
+ 	src/scene_item.h
++	src/scene_keyguide.cpp
++	src/scene_keyguide.h
+ 	src/scene_language.cpp
+ 	src/scene_language.h
+ 	src/scene_load.cpp
+diff -urN vendor/easyrpg-player-0.8.1.1/src/filesystem_stream.cpp work/src/easyrpg-player-0.8.1.1/src/filesystem_stream.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/filesystem_stream.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/filesystem_stream.cpp	2026-11-03 01:48:54.236759300 +0800
+@@ -16,9 +16,14 @@
+  */
+ 
+ #include "filesystem_stream.h"
++#include "output.h"
+ 
+ #include <utility>
+ 
++#ifdef __SWITCH__
++#  include <switch.h>
++#endif
++
+ #ifdef USE_CUSTOM_FILEBUF
+ #  include <unistd.h>
+ #endif
+@@ -94,8 +99,19 @@
+ }
+ 
+ void Filesystem_Stream::OutputStream::Close() {
++	if (!rdbuf()) {
++		return;
++	}
+ 	delete rdbuf();
+ 	set_rdbuf(nullptr);
++#ifdef __SWITCH__
++	if (fsdevGetDeviceFileSystem("save") != nullptr) {
++		Result rc = fsdevCommitDevice("save");
++		if (R_FAILED(rc)) {
++			Output::Warning("fsdevCommitDevice(save) failed: 0x{:X}", rc);
++		}
++	}
++#endif
+ }
+ 
+ Filesystem_Stream::InputMemoryStreamBufView::InputMemoryStreamBufView(Span<uint8_t> buffer_view)
+diff -urN vendor/easyrpg-player-0.8.1.1/src/game_config.cpp work/src/easyrpg-player-0.8.1.1/src/game_config.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/game_config.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/game_config.cpp	2026-11-09 20:35:23.377034500 +0800
+@@ -63,6 +63,10 @@
+ 	font2.SetOptionVisible(false);
+ 	font2_size.SetOptionVisible(false);
+ #endif
++#if defined(__SWITCH__)
++	log_enabled.Set(false);
++	log_enabled.SetOptionVisible(false);
++#endif
+ 	if (automatic_screenshots.IsOptionVisible()) {
+ 		automatic_screenshots_interval.SetLocked(!automatic_screenshots.Get());
+ 	}
+@@ -111,10 +115,11 @@
+ 	cfg.input.gamepad_swap_ab_and_xy.Set(true);
+ #endif
+ 
+-#if defined(USE_CUSTOM_FILEBUF) || defined(USE_LIBRETRO)
++#if defined(USE_CUSTOM_FILEBUF) || defined(USE_LIBRETRO) || defined(__SWITCH__)
+ 	// Disable logging by default on
+ 	// - platforms with slow IO or bad FS drivers
+ 	// - libretro because the frontend handles the logging
++	// - Nintendo Switch so no open log handle blocks fsdevCommitDevice("save") or writes to SD
+ 	cfg.player.log_enabled.Set(false);
+ #endif
+ 
+@@ -159,7 +164,7 @@
+ #elif defined(__WIIU__)
+ 		path = "fs:/vol/external01/wiiu/data/easyrpg-player";
+ #elif defined(__SWITCH__)
+-		path = "/switch/easyrpg-player";
++		path = "save:/";
+ #elif defined(__3DS__)
+ 		path = "sdmc:/data/easyrpg-player";
+ #elif defined(__vita__)
+@@ -522,7 +527,7 @@
+ 		}
+ 		if (cp.ParseNext(arg, 1, "--sound-volume")) {
+ 			if (arg.ParseValue(0, li_value)) {
+-				audio.music_volume.Set(li_value);
++				audio.sound_volume.Set(li_value);
+ 			}
+ 			continue;
+ 		}
+@@ -669,12 +674,16 @@
+ 	player.settings_in_menu.FromIni(ini);
+ 	player.lang_select_on_start.FromIni(ini);
+ 	player.lang_select_in_title.FromIni(ini);
++	player.language.FromIni(ini);
+ 	player.show_startup_logos.FromIni(ini);
+ 	player.font1.FromIni(ini);
+ 	player.font1_size.FromIni(ini);
+ 	player.font2.FromIni(ini);
+ 	player.font2_size.FromIni(ini);
+ 	player.log_enabled.FromIni(ini);
++#if defined(__SWITCH__)
++	player.log_enabled.Set(false);
++#endif
+ 	player.screenshot_scale.FromIni(ini);
+ 	player.screenshot_timestamp.FromIni(ini);
+ 	player.automatic_screenshots.FromIni(ini);
+@@ -761,6 +770,7 @@
+ 	player.settings_in_menu.ToIni(os);
+ 	player.lang_select_on_start.ToIni(os);
+ 	player.lang_select_in_title.ToIni(os);
++	player.language.ToIni(os);
+ 	player.show_startup_logos.ToIni(os);
+ 	player.font1.ToIni(os);
+ 	player.font1_size.ToIni(os);
+diff -urN vendor/easyrpg-player-0.8.1.1/src/game_config.h work/src/easyrpg-player-0.8.1.1/src/game_config.h
+--- vendor/easyrpg-player-0.8.1.1/src/game_config.h	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/game_config.h	2026-11-09 20:35:03.303380600 +0800
+@@ -98,11 +98,12 @@
+ 	PathConfigParam font2 { "Font 2", "The game chooses whether it wants font 1 or 2", "Player", "Font2", "" };
+ 	RangeConfigParam<int> font2_size { "Font 2 Size", "", "Player", "Font2Size", 12, 6, 16};
+ 	EnumConfigParam<ConfigEnum::StartupLangSelect, 3> lang_select_on_start {
+-		"Startup Language Menu", "Show language menu before booting up a game", "Player", "StartupLangSelect", ConfigEnum::StartupLangSelect::FirstStartup,
++		"Startup Language Menu", "Show language menu before booting up a game", "Player", "StartupLangSelect", ConfigEnum::StartupLangSelect::Never,
+ 		Utils::MakeSvArray("Never", "First Start", "Always"),
+ 		Utils::MakeSvArray("never", "FirstStartup", "always"),
+ 		Utils::MakeSvArray("Never show language menu on start", "Show on first start (when no save files are found)", "Always show language menu prior to the title screen") };
+ 	BoolConfigParam lang_select_in_title{ "Show language menu on title screen", "Display language menu item on the title screen", "Player", "LanguageInTitle", true };
++	StringConfigParam language{ "Language", "Preferred game language", "Player", "Language", "" };
+ 	BoolConfigParam log_enabled{ "Logging", "Write diagnostic messages into a logfile", "Player", "Logging", true };
+ 	RangeConfigParam<int> screenshot_scale { "Screenshot scaling factor", "Scale screenshots by the given factor", "Player", "ScreenshotScale", 1, 1, 24};
+ 	BoolConfigParam screenshot_timestamp{ "Screenshot timestamp", "Add the current date and time to the file name", "Player", "ScreenshotTimestamp", true };
+@@ -129,7 +130,7 @@
+ 		Utils::MakeSvArray("Scale to screen size (Causes scaling artifacts)", "Scale to multiple of the game resolution", "Like Nearest, but output is blurred to avoid artifacts")};
+ 	BoolConfigParam stretch{ "Stretch", "Stretch to the width of the window/screen", "Video", "Stretch", false };
+ 	BoolConfigParam pause_when_focus_lost{ "Pause when focus lost", "Pause the program when it is in the background", "Video", "PauseWhenFocusLost", true };
+-	BoolConfigParam touch_ui{ "Touch Ui", "Display the touch ui", "Video", "TouchUi", true };
++	BoolConfigParam touch_ui{ "Touch Ui", "Display the touch ui", "Video", "TouchUi", false };
+ 	EnumConfigParam<ConfigEnum::GameResolution, 3> game_resolution{ "Resolution", "Game resolution. Changes require a restart.", "Video", "GameResolution", ConfigEnum::GameResolution::Original,
+ 		Utils::MakeSvArray("Original (Recommended)", "Widescreen (Experimental)", "Ultrawide (Experimental)"),
+ 		Utils::MakeSvArray("original", "widescreen", "ultrawide"),
+diff -urN vendor/easyrpg-player-0.8.1.1/src/input_source.cpp work/src/easyrpg-player-0.8.1.1/src/input_source.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/input_source.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/input_source.cpp	2026-11-03 00:16:46.745530100 +0800
+@@ -203,6 +203,8 @@
+ }
+ 
+ void Input::Source::UpdateGamepad() {
++	analog_input = DisplayUi->GetAnalogInput();
++
+ 	// Configuration
+ 	if (cfg.gamepad_swap_analog.Get()) {
+ 		std::swap(analog_input.primary, analog_input.secondary);
+@@ -261,7 +263,6 @@
+ 	}
+ 
+ 	// Trigger
+-	analog_input = DisplayUi->GetAnalogInput();
+ 	keystates[Input::Keys::JOY_LTRIGGER_FULL] = (analog_input.trigger_left > AnalogInput::kMaxValue * 0.9);
+ 	keystates[Input::Keys::JOY_LTRIGGER_SOFT] =
+ 			(analog_input.trigger_left > JOYSTICK_TRIGGER_SENSIBILITY) &&
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/audio.cpp work/src/easyrpg-player-0.8.1.1/src/platform/switch/audio.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/audio.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/audio.cpp	2026-11-03 00:16:42.008743400 +0800
+@@ -59,15 +59,26 @@
+ 	}
+ 	
+ 	for(;;) {
+-		// A pretty bad way to close thread
+-		if (instance->termStream) {
+-			instance->termStream = false;
++		if (instance->termStream.load(std::memory_order_acquire)) {
++			instance->termStream.store(false, std::memory_order_release);
+ 			free(buffer1);
+ 			free(buffer2);
+ 			return;
+ 		}
+ 
+-		audoutWaitPlayFinish(&released_buffer, &released_count, UINT64_MAX);
++		released_buffer = nullptr;
++		released_count = 0;
++		Result rc = audoutWaitPlayFinish(&released_buffer, &released_count, 100'000'000ULL);
++		if (instance->termStream.load(std::memory_order_acquire)) {
++			instance->termStream.store(false, std::memory_order_release);
++			free(buffer1);
++			free(buffer2);
++			return;
++		}
++		if (R_FAILED(rc) || released_count == 0 || released_buffer == nullptr) {
++			continue;
++		}
++
+ 		instance->LockMutex();
+ 		instance->Decode((uint8_t*)released_buffer->buffer, buf_size);
+ 		instance->UnlockMutex();
+@@ -80,6 +91,7 @@
+ 	GenericAudio(cfg)
+ {
+ 	instance = this;
++	termStream.store(false, std::memory_order_relaxed);
+ 
+ 	audoutInitialize();
+ 	audoutStartAudioOut();
+@@ -98,7 +110,7 @@
+ 
+ NxAudio::~NxAudio() {
+ 	// Closing streaming thread
+-	termStream = true;
++	termStream.store(true, std::memory_order_release);
+ 	threadWaitForExit(&audio_thread);
+ 	
+ 	// Deleting thread
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/audio.h work/src/easyrpg-player-0.8.1.1/src/platform/switch/audio.h
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/audio.h	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/audio.h	2026-11-03 00:16:37.138016000 +0800
+@@ -18,6 +18,7 @@
+ #ifndef EP_PLATFORM_SWITCH_AUDIO_H
+ #define EP_PLATFORM_SWITCH_AUDIO_H
+ 
++#include <atomic>
+ #include <switch.h>
+ 
+ #include "audio_generic.h"
+@@ -30,7 +31,7 @@
+ 	void LockMutex() const override;
+ 	void UnlockMutex() const override;
+ 	
+-	volatile bool termStream = false;
++	std::atomic<bool> termStream{false};
+ 
+ private:
+ 	Thread audio_thread;
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/input_buttons.cpp work/src/easyrpg-player-0.8.1.1/src/platform/switch/input_buttons.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/input_buttons.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/input_buttons.cpp	2026-11-03 01:12:57.688395400 +0800
+@@ -29,16 +29,10 @@
+ 		{RIGHT, Keys::JOY_DPAD_RIGHT},
+ 		{DECISION, Keys::JOY_A},
+ 		{CANCEL, Keys::JOY_B},
+-		{CANCEL, Keys::JOY_X},
+-		{SHIFT, Keys::JOY_Y},
+-		{N0, Keys::JOY_LSTICK},
+-		{N5, Keys::JOY_RSTICK},
+-		{DEBUG_THROUGH, Keys::JOY_SHOULDER_LEFT},
+-		{TOGGLE_FPS, Keys::JOY_SHOULDER_RIGHT},
+-		{SETTINGS_MENU, Keys::JOY_START},
+-		{RESET, Keys::JOY_BACK},
++		{CANCEL, Keys::JOY_START},
++		{SHIFT, Keys::JOY_SHOULDER_RIGHT},
++		{SETTINGS_MENU, Keys::JOY_BACK},
+ 		{FAST_FORWARD_A, Keys::JOY_RTRIGGER_FULL},
+-		{DEBUG_MENU, Keys::JOY_LTRIGGER_FULL},
+ #endif
+ 		// Touchscreen
+ 		{N0, Keys::N0},
+@@ -56,21 +50,12 @@
+ 		{MULTIPLY, Keys::KP_MULTIPLY},
+ 		{DIVIDE, Keys::KP_DIVIDE},
+ 		{PERIOD, Keys::KP_PERIOD},
+-		{CANCEL, Keys::JOY_TOUCH},
+ 
+ #if defined(USE_JOYSTICK_AXIS) && defined(SUPPORT_JOYSTICK_AXIS)
+ 		{UP, Keys::JOY_LSTICK_UP},
+ 		{DOWN, Keys::JOY_LSTICK_DOWN},
+ 		{LEFT, Keys::JOY_LSTICK_LEFT},
+-		{RIGHT, Keys::JOY_LSTICK_RIGHT},
+-		{N1, Keys::JOY_RSTICK_DOWN_LEFT},
+-		{N2, Keys::JOY_RSTICK_DOWN},
+-		{N3, Keys::JOY_RSTICK_DOWN_RIGHT},
+-		{N4, Keys::JOY_RSTICK_LEFT},
+-		{N6, Keys::JOY_RSTICK_RIGHT},
+-		{N7, Keys::JOY_RSTICK_UP_LEFT},
+-		{N8, Keys::JOY_RSTICK_UP},
+-		{N9, Keys::JOY_RSTICK_UP_RIGHT}
++		{RIGHT, Keys::JOY_LSTICK_RIGHT}
+ #endif
+ 	};
+ }
+@@ -80,7 +65,7 @@
+ 		{Keys::JOY_DPAD_UP, "D-Pad Up"},
+ 		{Keys::JOY_DPAD_DOWN, "D-Pad Down"},
+ 		{Keys::JOY_DPAD_LEFT, "D-Pad Left"},
+-		{Keys::JOY_DPAD_RIGHT, "D-Pad Up"},
++		{Keys::JOY_DPAD_RIGHT, "D-Pad Right"},
+ 		{Keys::JOY_A, "A"},
+ 		{Keys::JOY_B, "B"},
+ 		{Keys::JOY_X, "X"},
+@@ -112,7 +97,9 @@
+ }
+ 
+ void Input::GetSupportedConfig(Game_ConfigInput& cfg) {
+-	cfg.gamepad_swap_ab_and_xy.SetOptionVisible(true);
+-	cfg.gamepad_swap_analog.SetOptionVisible(true);
+-	cfg.gamepad_swap_dpad_with_buttons.SetOptionVisible(true);
++	// Keep the fixed Yume Nikki layout; do not expose remapping options that
++	// would break the L+ABXY number-key layer.
++	cfg.gamepad_swap_ab_and_xy.SetOptionVisible(false);
++	cfg.gamepad_swap_analog.SetOptionVisible(false);
++	cfg.gamepad_swap_dpad_with_buttons.SetOptionVisible(false);
+ }
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/input_mapping.h work/src/easyrpg-player-0.8.1.1/src/platform/switch/input_mapping.h
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/input_mapping.h	1970-01-01 08:00:00.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/input_mapping.h	2026-11-03 01:12:56.285255800 +0800
+@@ -0,0 +1,132 @@
++/*
++ * This file is part of EasyRPG Player.
++ *
++ * EasyRPG Player is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * EasyRPG Player is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with EasyRPG Player. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef EP_PLATFORM_SWITCH_INPUT_MAPPING_H
++#define EP_PLATFORM_SWITCH_INPUT_MAPPING_H
++
++#include "keys.h"
++
++#include <bitset>
++#include <cstddef>
++
++namespace SwitchInput {
++	struct PadState {
++		bool up = false;
++		bool down = false;
++		bool left = false;
++		bool right = false;
++		bool a = false;
++		bool b = false;
++		bool x = false;
++		bool y = false;
++		bool l = false;
++		bool r = false;
++		bool zl = false;
++		bool zr = false;
++		bool plus = false;
++		bool minus = false;
++	};
++
++	struct ModifierState {
++		// Latches face buttons that were active while L was held so releasing L
++		// before releasing A/B does not false-trigger a normal button press.
++		bool suppress_normal_a = false;
++		bool suppress_normal_b = false;
++
++		// Latches face buttons that were already held before L was pressed so
++		// pressing L while confirming (A held) or cancelling (B held) does not
++		// accidentally fire a number-key effect chord.
++		bool suppress_chord_a = false;
++		bool suppress_chord_b = false;
++	};
++
++	/**
++	 * Applies the Yume Nikki Switch control layout to the raw key state.
++	 *
++	 * - A: Decision / Confirm (L+A = N1, Effect action 1)
++	 * - B: Cancel (L+B = N3, Effect action 2)
++	 * - X: N9 (Pinch cheek / wake up)
++	 * - Y: N5 (Drop effect)
++	 * - R: Run (SHIFT)
++	 * - Plus (+): In-game Menu (CANCEL)
++	 * - Minus (-): EasyRPG Settings Menu (SETTINGS_MENU)
++	 * - ZR: Fast-forward (FAST_FORWARD_A)
++	 *
++	 * This function deliberately has no libnx dependency so it can be tested
++	 * on the host.
++	 */
++	inline void ApplyPad(const PadState& pad, std::bitset<Input::Keys::KEYS_COUNT>& keys, ModifierState& state) {
++		auto update_latch = [](bool l_held, bool btn_held, bool& suppress_normal, bool& suppress_chord) {
++			if (!btn_held) {
++				suppress_normal = false;
++				suppress_chord = false;
++			} else if (l_held) {
++				if (!suppress_chord) {
++					suppress_normal = true;
++				}
++			} else {
++				if (!suppress_normal) {
++					suppress_chord = true;
++				}
++			}
++		};
++
++		update_latch(pad.l, pad.a, state.suppress_normal_a, state.suppress_chord_a);
++		update_latch(pad.l, pad.b, state.suppress_normal_b, state.suppress_chord_b);
++
++		// Clear the number keys every frame.
++		keys[Input::Keys::N1] = false;
++		keys[Input::Keys::N3] = false;
++		keys[Input::Keys::N5] = false;
++		keys[Input::Keys::N9] = false;
++
++		// Movement remains available at all times.
++		keys[Input::Keys::JOY_DPAD_UP] = pad.up;
++		keys[Input::Keys::JOY_DPAD_DOWN] = pad.down;
++		keys[Input::Keys::JOY_DPAD_LEFT] = pad.left;
++		keys[Input::Keys::JOY_DPAD_RIGHT] = pad.right;
++
++		// Normal A/B actions (suppressed while L is held or until released after an L+A/B chord).
++		keys[Input::Keys::JOY_A] = !pad.l && pad.a && !state.suppress_normal_a;
++		keys[Input::Keys::JOY_B] = !pad.l && pad.b && !state.suppress_normal_b;
++		keys[Input::Keys::JOY_X] = false;
++		keys[Input::Keys::JOY_Y] = false;
++
++		// Number-key actions: L+A=N1, L+B=N3, Y=N5 (drop effect), X=N9 (pinch cheek).
++		keys[Input::Keys::N1] = pad.l && pad.a && !state.suppress_chord_a;
++		keys[Input::Keys::N3] = pad.l && pad.b && !state.suppress_chord_b;
++		keys[Input::Keys::N5] = pad.y;
++		keys[Input::Keys::N9] = pad.x;
++
++		// Shoulder, stick, and menu buttons.
++		keys[Input::Keys::JOY_SHOULDER_LEFT] = false;
++		keys[Input::Keys::JOY_SHOULDER_RIGHT] = pad.r;
++		keys[Input::Keys::JOY_LSTICK] = false;
++		keys[Input::Keys::JOY_RSTICK] = false;
++		keys[Input::Keys::JOY_BACK] = pad.minus;
++		keys[Input::Keys::JOY_START] = pad.plus;
++		keys[Input::Keys::JOY_LTRIGGER_FULL] = pad.zl;
++		keys[Input::Keys::JOY_RTRIGGER_FULL] = pad.zr;
++	}
++
++	inline void ApplyPad(const PadState& pad, std::bitset<Input::Keys::KEYS_COUNT>& keys) {
++		ModifierState stateless;
++		ApplyPad(pad, keys, stateless);
++	}
++}
++
++#endif
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/main.cpp work/src/easyrpg-player-0.8.1.1/src/platform/switch/main.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/main.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/main.cpp	2026-11-09 23:03:23.858004700 +0800
+@@ -16,8 +16,11 @@
+  */
+ 
+ #include <switch.h>
+-#include <unistd.h>
++#include <sys/stat.h>
++#include <cerrno>
++#include <cstring>
+ #include <string>
++#include <unistd.h>
+ #include <vector>
+ #include "player.h"
+ #include "output.h"
+@@ -25,6 +28,262 @@
+ namespace {
+ 	int nxlinkSocket = -1;
+ 	bool is_nro = true;
++	bool nand_save_mounted = false;
++
++	constexpr u64 kTitleId = 0x0100A1B2C3D40000ULL;
++	constexpr s64 kSaveDataSize = 16LL * 1024 * 1024;    // 16 MiB
++	constexpr s64 kJournalSize = 16LL * 1024 * 1024;     // 16 MiB
++
++	constexpr const char* kNandSaveRoot = "save:/";
++	constexpr const char* kSdmcAppRoot = "sdmc:/switch/yumenikki-nx";
++	constexpr const char* kSdmcSaveRoot = "sdmc:/switch/yumenikki-nx/save";
++
++	void EnsureDirectory(const char* path) {
++		if (mkdir(path, 0777) == -1 && errno != EEXIST) {
++			Output::Warning("Could not create directory {}: {}", path, strerror(errno));
++		}
++	}
++
++	void EnsureSdmcFallbackDirectories() {
++		if (fsdevGetDeviceFileSystem("sdmc") == nullptr) {
++			if (R_FAILED(fsdevMountSdmc())) {
++				Output::Warning("Could not mount sdmc for fallback saves/config.");
++				return;
++			}
++		}
++		EnsureDirectory("sdmc:/switch");
++		EnsureDirectory(kSdmcAppRoot);
++		EnsureDirectory(kSdmcSaveRoot);
++	}
++
++	bool AcquireActiveUser(AccountUid& out_uid) {
++		out_uid = {};
++
++		Result rc = accountInitialize(AccountServiceType_Application);
++		if (R_FAILED(rc)) {
++			rc = accountInitialize(AccountServiceType_System);
++		}
++		if (R_FAILED(rc)) {
++			rc = accountInitialize(AccountServiceType_Administrator);
++		}
++
++		if (R_SUCCEEDED(rc)) {
++			// 1. Standard HOS StartupUserAccount=Required flow: preselected user before launch
++			if (R_FAILED(accountGetPreselectedUser(&out_uid)) || !accountUidIsValid(&out_uid)) {
++				// 2. If launched without a preselected user (e.g. Title Override or emulator),
++				//    try showing the official HOS Profile Selector applet.
++				PselUiSettings ui;
++				if (R_SUCCEEDED(pselUiCreate(&ui, PselUiMode_UserSelector))) {
++					pselUiShow(&ui, &out_uid);
++				}
++			}
++
++			// 3. Fallback to last opened user or first registered console account
++			if (!accountUidIsValid(&out_uid)) {
++				accountGetLastOpenedUser(&out_uid);
++			}
++			if (!accountUidIsValid(&out_uid)) {
++				AccountUid uids[ACC_USER_LIST_SIZE] = {};
++				s32 actual_total = 0;
++				if (R_SUCCEEDED(accountListAllUsers(uids, ACC_USER_LIST_SIZE, &actual_total)) && actual_total > 0) {
++					out_uid = uids[0];
++				}
++			}
++
++			accountExit();
++		} else {
++			// Even if account service init failed, try the Profile Selector applet directly
++			PselUiSettings ui;
++			if (R_SUCCEEDED(pselUiCreate(&ui, PselUiMode_UserSelector))) {
++				pselUiShow(&ui, &out_uid);
++			}
++		}
++
++		return accountUidIsValid(&out_uid);
++	}
++
++	Result TryMountSaveDataForUser(AccountUid uid) {
++		Result rc = fsdevMountSaveData("save", FS_SAVEDATA_CURRENT_APPLICATIONID, uid);
++		if (R_FAILED(rc)) {
++			rc = fsdevMountSaveData("save", kTitleId, uid);
++		}
++		return rc;
++	}
++
++	Result CreateAccountSaveDataForUser(AccountUid uid) {
++		FsSaveDataAttribute attr = {};
++		attr.application_id = kTitleId;
++		attr.uid = uid;
++		attr.save_data_type = FsSaveDataType_Account;
++
++		FsSaveDataCreationInfo crt = {};
++		crt.save_data_size = kSaveDataSize;
++		crt.journal_size = kJournalSize;
++		crt.available_size = 0x4000;
++		crt.owner_id = kTitleId;
++		crt.flags = 0;
++		crt.save_data_space_id = FsSaveDataSpaceId_User;
++
++		FsSaveDataMetaInfo meta = {};
++		meta.size = 0x40060;
++		meta.type = FsSaveDataMetaType_Thumbnail;
++
++		return fsCreateSaveDataFileSystem(&attr, &crt, &meta);
++	}
++
++	bool MountNandAccountSaveData() {
++		AccountUid uid = {};
++		if (!AcquireActiveUser(uid)) {
++			Output::Warning("No valid HOS AccountUid available for NAND save data.");
++			return false;
++		}
++
++		Result rc = TryMountSaveDataForUser(uid);
++		if (R_FAILED(rc)) {
++			// If HOS did not auto-create the save container yet (e.g., emulator or NRO override),
++			// create the Account SaveData container on NAND and retry mounting.
++			CreateAccountSaveDataForUser(uid);
++			rc = TryMountSaveDataForUser(uid);
++		}
++
++		if (R_FAILED(rc)) {
++			Output::Warning("Could not mount NAND save:/ (rc=0x{:X}); falling back to SD card.", rc);
++			return false;
++		}
++
++		return true;
++	}
++
++	std::string ReadSavedLanguage(const char* config_root) {
++		std::string path = config_root;
++		if (path.back() != '/') {
++			path += '/';
++		}
++		path += "easyrpg.ini";
++		FILE* f = fopen(path.c_str(), "r");
++		if (!f) {
++			return "";
++		}
++		char line[256];
++		std::string lang = "";
++		while (fgets(line, sizeof(line), f)) {
++			if (strncmp(line, "Language=", 9) == 0 || strncmp(line, "language=", 9) == 0) {
++				char* val = line + 9;
++				while (*val == ' ' || *val == '\t') val++;
++				char* end = val + strlen(val);
++				while (end > val && (*(end - 1) == '\r' || *(end - 1) == '\n' || *(end - 1) == ' ' || *(end - 1) == '\t')) {
++					*(--end) = '\0';
++				}
++				lang = val;
++				break;
++			}
++		}
++		fclose(f);
++		return lang;
++	}
++
++	bool IsBaseLanguageJapanese() {
++		// If romfs:/Language/en or romfs:/language/en exists, the translation directory provides English,
++		// which indicates the base game (default) is Japanese (e.g. Yume 2kki).
++		if (::access("romfs:/Language/en", F_OK) == 0 || ::access("romfs:/language/en", F_OK) == 0) {
++			return true;
++		}
++		return false;
++	}
++
++	std::string GetSwitchHostLanguage() {
++		u64 language_code = 0;
++		Result rc = setInitialize();
++		if (R_SUCCEEDED(rc)) {
++			rc = setGetSystemLanguage(&language_code);
++			setExit();
++		}
++		bool base_is_ja = IsBaseLanguageJapanese();
++		if (R_FAILED(rc)) {
++			return base_is_ja ? "en" : "default";
++		}
++
++		SetLanguage set_lang = SetLanguage_ENUS;
++		if (R_SUCCEEDED(setMakeLanguage(language_code, &set_lang))) {
++			if (base_is_ja) {
++				// Base game is Japanese (Yume 2kki)
++				switch (set_lang) {
++					case SetLanguage_JA:
++						return "default";
++					case SetLanguage_ZHCN:
++					case SetLanguage_ZHHANS:
++					case SetLanguage_ZHTW:
++					case SetLanguage_ZHHANT:
++						return "zh";
++					case SetLanguage_KO:
++						return "ko";
++					case SetLanguage_ENUS:
++					case SetLanguage_ENGB:
++						return "en";
++					case SetLanguage_ES:
++					case SetLanguage_ES419:
++						return "es";
++					case SetLanguage_FR:
++					case SetLanguage_FRCA:
++						return "fr";
++					case SetLanguage_RU:
++						return "ru";
++					case SetLanguage_PT:
++					case SetLanguage_PTBR:
++						return "pt_br";
++					default:
++						return "en";
++				}
++			} else {
++				// Base game is English/Playism (Yume Nikki)
++				switch (set_lang) {
++					case SetLanguage_JA:
++						return "ja";
++					case SetLanguage_ZHCN:
++					case SetLanguage_ZHHANS:
++						return "zh";
++					case SetLanguage_ZHTW:
++					case SetLanguage_ZHHANT:
++						return "zh_tr";
++					case SetLanguage_KO:
++						return "ko";
++					case SetLanguage_FR:
++					case SetLanguage_FRCA:
++						return "fr";
++					case SetLanguage_DE:
++						return "de";
++					case SetLanguage_IT:
++						return "it";
++					case SetLanguage_ES:
++					case SetLanguage_ES419:
++						return "es";
++					case SetLanguage_RU:
++						return "ru";
++					case SetLanguage_PT:
++					case SetLanguage_PTBR:
++						return "pt_br";
++					case SetLanguage_ENUS:
++					case SetLanguage_ENGB:
++						return "default";
++					default:
++						break;
++				}
++			}
++		}
++
++		char code_str[9] = {};
++		std::memcpy(code_str, &language_code, sizeof(language_code));
++		if (code_str[0] >= 'a' && code_str[0] <= 'z') {
++			std::string prefix(code_str, 2);
++			if (base_is_ja) {
++				if (prefix == "ja") return "default";
++				return prefix;
++			}
++			return prefix;
++		}
++
++		return base_is_ja ? "en" : "default";
++	}
+ }
+ 
+ static void LogCallback(LogLevel lvl, std::string const& msg, LogCallbackUserData /* userdata */) {
+@@ -44,6 +303,7 @@
+ }
+ 
+ void SwitchExit() {
++	Output::Quit();
+ 	romfsExit();
+ 
+ 	// Close debug log
+@@ -53,6 +313,14 @@
+ 		nxlinkSocket = -1;
+ 	}
+ 
++	// Commit NAND save data journal before unmounting devices
++	if (fsdevGetDeviceFileSystem("save") != nullptr) {
++		fsdevCommitDevice("save");
++	}
++
++	// Flush and unmount devices before unlocking exit
++	fsdevUnmountAll();
++
+ 	// HOS will close us immediately afterwards, if requested by home menu.
+ 	// So no further cleanup possible.
+ 	appletUnlockExit();
+@@ -63,14 +331,20 @@
+ 
+ 	appletLockExit();
+ 
++	// Disable file logging on Switch so early log calls do not touch sdmc:/
++	// and no open log file handle prevents fsdevCommitDevice("save").
++	Player::player_config.log_enabled.Set(false);
++
+ 	// suyu/nso
+ 	is_nro = envHasArgv();
+ 	Output::SetLogCallback(LogCallback);
+ 
+-	if(!is_nro) {
++	if (!is_nro) {
+ 		Output::Debug("Running inside emulator or as NSO.");
++	}
+ 
+-		// set arbitrary application path
++	// Ensure argv[0] program path placeholder always exists for CmdlineParser
++	if (args.empty()) {
+ 		args.push_back("none:/easyrpg-player");
+ 	}
+ 
+@@ -81,6 +355,13 @@
+ 			socketExit();
+ 	}
+ 
++	// Mount official HOS per-user NAND save data ("save:/").
++	// Only fall back to SD card if NAND save mounting is unavailable (e.g. restricted NRO applet mode).
++	nand_save_mounted = MountNandAccountSaveData();
++	if (!nand_save_mounted) {
++		EnsureSdmcFallbackDirectories();
++	}
++
+ 	romfsInit();
+ 
+ 	// Check if romfs has some files inside or not
+@@ -89,15 +370,34 @@
+ 
+ 		args.push_back("--project-path");
+ 		args.push_back("romfs:/");
++	} else {
++		Output::Warning("romfs:/RPG_RT.lmt was not found; the NSP RomFS is incomplete.");
++	}
+ 
+-		// Use cwd as savepath, assuming each packaged game has an own directory
+-		// This will not work if somebody ever packages a game as nso
+-		if (is_nro) {
+-			char working_dir[256];
+-			getcwd(working_dir, 255);
+-			args.push_back("--save-path");
+-			args.push_back(working_dir);
+-		}
++	// Store save files and settings in official NAND Account Save Data (save:/),
++	// with automatic fallback to SD card only if save:/ could not be mounted.
++	const char* config_dir = nand_save_mounted ? kNandSaveRoot : kSdmcAppRoot;
++	const char* save_dir = nand_save_mounted ? kNandSaveRoot : kSdmcSaveRoot;
++
++	args.push_back("--save-path");
++	args.push_back(save_dir);
++	args.push_back("--config-path");
++	args.push_back(config_dir);
++
++	// Multi-language resolution:
++	// 1. If player previously chose and saved a language in easyrpg.ini, use it.
++	// 2. Otherwise, auto-detect the Switch console system language.
++	std::string active_lang = ReadSavedLanguage(config_dir);
++	if (active_lang.empty()) {
++		active_lang = GetSwitchHostLanguage();
++		Output::Debug("Auto-detected Switch host language: {}", active_lang);
++	} else {
++		Output::Debug("Using user-configured saved language: {}", active_lang);
++	}
++
++	if (!active_lang.empty() && active_lang != "default") {
++		args.push_back("--language");
++		args.push_back(active_lang);
+ 	}
+ 
+ 	// Setup platform teardown code
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/ui.cpp work/src/easyrpg-player-0.8.1.1/src/platform/switch/ui.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/ui.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/ui.cpp	2026-11-03 00:16:01.837601000 +0800
+@@ -29,12 +29,14 @@
+ #include <EGL/eglext.h>
+ #include <glad/glad.h>
+ 
++#include <algorithm>
+ #include <cstring>
+ #include <cstdio>
+ #include <iostream>
+ #include <unistd.h>
+ 
+ #include "touch_ui_png.h"
++#include "input_mapping.h"
+ 
+ #ifdef SUPPORT_AUDIO
+ #include "audio.h"
+@@ -102,6 +104,8 @@
+ 	};
+ 
+ 	bool is_docked = false;
++	int display_width = 1920;
++	int display_height = 1080;
+ }
+ 
+ static void initEgl() {
+@@ -208,7 +212,7 @@
+ static AppletHookCookie applet_hook_cookie;
+ 
+ static void appletHookCallback(AppletHookType hook, void* param) {
+-	bool show_message = (bool *)param;
++	bool show_message = (param != nullptr);
+ 	// HOS sends one focus event on application start (but not in applet mode), we ignore this
+ 	static bool first_time = true;
+ 
+@@ -226,15 +230,12 @@
+ 				if (show_message)
+ 					Output::Debug("Gained Focus, resuming execution.");
+ 				Player::Resume();
+-				appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
+ 			} else {
+ 				if (first_time)
+ 					first_time = false;
+ 				if (show_message)
+ 					Output::Debug("Lost focus, pausing execution.");
+ 				Player::Pause();
+-				// allow suspend
+-				appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
+ 			}
+ 			break;
+ 
+@@ -259,6 +260,8 @@
+ 				width = 1280;
+ 				height = 720;
+ 			}
++			display_width = width;
++			display_height = height;
+ 			nwindowSetCrop(nwindowGetDefault(), 0, 0, width, height);
+ 			glViewport(0, 1080-height, width, height);
+ 			break;
+@@ -289,7 +292,7 @@
+ 		(hosversionIsAtmosphere() ? ", Atmosphere" : ", unknown/no"));
+ 
+ 	appletHook(&applet_hook_cookie, appletHookCallback, (void *)true);
+-	appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
++	appletSetFocusHandlingMode(AppletFocusHandlingMode_SuspendHomeSleepNotify);
+ 
+ 	nwindowSetDimensions(nwindowGetDefault(), 1920, 1080);
+ 	initEgl();
+@@ -371,7 +374,11 @@
+ 	padInitializeDefault(&pad);
+ 	hidInitializeTouchScreen();
+ 
+-	vcfg.touch_ui.SetLocked(vcfg.stretch.Get());
++	vcfg.vsync.SetLocked(true);
++	vcfg.stretch.Set(false);
++	vcfg.stretch.SetLocked(true);
++	vcfg.touch_ui.Set(false);
++	vcfg.touch_ui.SetLocked(true);
+ }
+ 
+ NxUi::~NxUi() {
+@@ -395,9 +402,15 @@
+ 		return false;
+ 	}
+ 
+-	// skip, when out of focus
+-	if(appletGetFocusState() != AppletFocusState_InFocus) {
+-		return true;
++	// Wait while out of focus so the game loop does not advance in the background
++	while (appletGetFocusState() != AppletFocusState_InFocus) {
++		modifier_state_ = {};
++		keys.reset();
++		analog_input = {};
++		svcSleepThread(16'666'667ULL);
++		if (!appletMainLoop()) {
++			return false;
++		}
+ 	}
+ 
+ 	padUpdate(&pad);
+@@ -409,20 +422,23 @@
+ 	}
+ 
+ 	u64 input = padGetButtons(&pad);
+-	keys[Input::Keys::JOY_DPAD_UP] = (input & HidNpadButton_Up);
+-	keys[Input::Keys::JOY_DPAD_DOWN] = (input & HidNpadButton_Down);
+-	keys[Input::Keys::JOY_DPAD_RIGHT] = (input & HidNpadButton_Right);
+-	keys[Input::Keys::JOY_DPAD_LEFT] = (input & HidNpadButton_Left);
+-	keys[Input::Keys::JOY_A] = (input & HidNpadButton_A);
+-	keys[Input::Keys::JOY_B] = (input & HidNpadButton_B);
+-	keys[Input::Keys::JOY_X] = (input & HidNpadButton_X);
+-	keys[Input::Keys::JOY_Y] = (input & HidNpadButton_Y);
+-	keys[Input::Keys::JOY_LSTICK] = (input & HidNpadButton_StickL);
+-	keys[Input::Keys::JOY_RSTICK] = (input & HidNpadButton_StickR);
+-	keys[Input::Keys::JOY_SHOULDER_LEFT] = (input & (HidNpadButton_L|HidNpadButton_AnySL)) > 0;
+-	keys[Input::Keys::JOY_SHOULDER_RIGHT] = (input & (HidNpadButton_R|HidNpadButton_AnySR)) > 0;
+-	keys[Input::Keys::JOY_BACK] = (input & HidNpadButton_Minus);
+-	keys[Input::Keys::JOY_START] = (input & HidNpadButton_Plus);
++
++	SwitchInput::PadState pad_state;
++	pad_state.up = (input & HidNpadButton_Up) != 0;
++	pad_state.down = (input & HidNpadButton_Down) != 0;
++	pad_state.left = (input & HidNpadButton_Left) != 0;
++	pad_state.right = (input & HidNpadButton_Right) != 0;
++	pad_state.a = (input & HidNpadButton_A) != 0;
++	pad_state.b = (input & HidNpadButton_B) != 0;
++	pad_state.x = (input & HidNpadButton_X) != 0;
++	pad_state.y = (input & HidNpadButton_Y) != 0;
++	pad_state.l = (input & HidNpadButton_L) != 0;
++	pad_state.r = (input & HidNpadButton_R) != 0;
++	pad_state.zl = (input & HidNpadButton_ZL) != 0;
++	pad_state.zr = (input & HidNpadButton_ZR) != 0;
++	pad_state.plus = (input & HidNpadButton_Plus) != 0;
++	pad_state.minus = (input & HidNpadButton_Minus) != 0;
++	SwitchInput::ApplyPad(pad_state, keys, modifier_state_);
+ 
+ 	HidAnalogStickState analog_left = padGetStickPos(&pad, 0);
+ 	HidAnalogStickState analog_right = padGetStickPos(&pad, 1);
+@@ -467,6 +483,15 @@
+ 	float aspectX = 1.0f;
+ 	float aspectY = 1.0f;
+ 
++	// Keep the original 320x240 image in an integer-scaled 4:3 rectangle.
++	if (!vcfg.stretch.Get() && display_width > 0 && display_height > 0) {
++		int scale = std::max(1, std::min(
++			display_width / main_surface->GetWidth(),
++			display_height / main_surface->GetHeight()));
++		aspectX = static_cast<float>(main_surface->GetWidth() * scale) / display_width;
++		aspectY = static_cast<float>(main_surface->GetHeight() * scale) / display_height;
++	}
++
+ 	// clear
+ 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+@@ -487,8 +512,6 @@
+ 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, main_surface->GetWidth(),
+ 		main_surface->GetHeight(), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+ 		main_surface->pixels());
+-	if (!vcfg.stretch.Get())
+-		aspectX = 0.75f;
+ 	glUniform2f(dimsLocation, aspectX, aspectY);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+ 
+@@ -507,14 +530,8 @@
+ 
+ void NxUi::vGetConfig(Game_ConfigVideo& cfg) const {
+ 	cfg.renderer.Lock("Switch NX (Software)");
+-	cfg.stretch.SetOptionVisible(true);
+-	cfg.touch_ui.SetOptionVisible(true);
+ 
+-	if (is_docked) {
+-		cfg.touch_ui.SetLocked(true);
+-		cfg.touch_ui.SetDescription("Only available in handheld mode");
+-	} else if (cfg.stretch.Get()) {
+-		cfg.touch_ui.SetLocked(true);
+-		cfg.touch_ui.SetDescription("Not available when stretch is enabled");
+-	}
++	// Keep the fixed 4:3 integer-scale presentation for this port.
++	cfg.stretch.SetOptionVisible(false);
++	cfg.touch_ui.SetOptionVisible(false);
+ }
+diff -urN vendor/easyrpg-player-0.8.1.1/src/platform/switch/ui.h work/src/easyrpg-player-0.8.1.1/src/platform/switch/ui.h
+--- vendor/easyrpg-player-0.8.1.1/src/platform/switch/ui.h	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/platform/switch/ui.h	2026-11-03 00:15:50.465508200 +0800
+@@ -23,6 +23,7 @@
+ #include "color.h"
+ #include "rect.h"
+ #include "system.h"
++#include "input_mapping.h"
+ 
+ /**
+  * NxUi class.
+@@ -62,6 +63,7 @@
+ 	BitmapRef touch_ui;
+ 	PadState pad;
+ 	HidTouchScreenState touch = {0};
++	SwitchInput::ModifierState modifier_state_;
+ 
+ #ifdef SUPPORT_AUDIO
+ 	std::unique_ptr<AudioInterface> audio_;
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene.cpp work/src/easyrpg-player-0.8.1.1/src/scene.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene.cpp	2026-11-09 20:35:50.494712700 +0800
+@@ -69,7 +69,8 @@
+ 	"GameBrowser",
+ 	"Teleport",
+ 	"Settings",
+-	"Language"
++	"Language",
++	"KeyGuide"
+ };
+ 
+ enum PushPopOperation {
+@@ -85,6 +86,7 @@
+ 		case GameBrowser:
+ 		case SceneMax:
+ 		case Logo:
++		case KeyGuide:
+ 			break;
+ 		case Title:
+ 			return lcf::rpg::SaveSystem::Scene_title;
+@@ -375,6 +377,8 @@
+ 
+ 	if (!Player::startup_language.empty()) {
+ 		Player::translation.SelectLanguage(Player::startup_language);
++	} else if (!Player::player_config.language.Get().empty()) {
++		Player::translation.SelectLanguage(Player::player_config.language.Get());
+ 	} else if (Player::translation.HasTranslations()) {
+ 		if (Player::player_config.lang_select_on_start.Get() == ConfigEnum::StartupLangSelect::Always
+ 			|| (!FileFinder::HasSavegame() && Player::player_config.lang_select_on_start.Get() == ConfigEnum::StartupLangSelect::FirstStartup)) {
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene.h work/src/easyrpg-player-0.8.1.1/src/scene.h
+--- vendor/easyrpg-player-0.8.1.1/src/scene.h	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene.h	2026-11-03 04:31:12.632212000 +0800
+@@ -60,6 +60,7 @@
+ 		Teleport,
+ 		Settings,
+ 		LanguageMenu,
++		KeyGuide,
+ 		SceneMax
+ 	};
+ 
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_keyguide.cpp work/src/easyrpg-player-0.8.1.1/src/scene_keyguide.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene_keyguide.cpp	1970-01-01 08:00:00.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_keyguide.cpp	2026-11-03 04:31:17.076205700 +0800
+@@ -0,0 +1,95 @@
++/*
++ * This file is part of EasyRPG Player.
++ *
++ * EasyRPG Player is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * EasyRPG Player is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with EasyRPG Player. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Headers
++#include "scene_keyguide.h"
++#include "bitmap.h"
++#include "cache.h"
++#include "game_system.h"
++#include "input.h"
++#include "main_data.h"
++#include "player.h"
++#include "scene_settings.h"
++#include "transition.h"
++
++Scene_KeyGuide::Scene_KeyGuide() {
++	type = Scene::KeyGuide;
++}
++
++void Scene_KeyGuide::Start() {
++	FileRequestAsync* request = AsyncHandler::RequestFile("Picture", "SwitchKeyGuide");
++	request->SetGraphicFile(true);
++	request_id = request->Bind(&Scene_KeyGuide::OnGraphicReady, this);
++	request->Start();
++}
++
++void Scene_KeyGuide::OnGraphicReady(FileRequestResult* result) {
++	if (!result || !result->success) {
++		Scene::Pop();
++		Player::SetupNewGame();
++		return;
++	}
++
++	background = std::make_unique<Sprite>();
++	BitmapRef bitmapRef = Cache::Picture(result->file, false);
++	background->SetBitmap(bitmapRef);
++
++	if (bitmapRef->GetWidth() < Player::screen_width) {
++		background->SetX(Player::menu_offset_x);
++	}
++	if (bitmapRef->GetHeight() < Player::screen_height) {
++		background->SetY(Player::menu_offset_y);
++	}
++}
++
++void Scene_KeyGuide::DrawBackground(Bitmap& dst) {
++	dst.Clear();
++}
++
++void Scene_KeyGuide::vUpdate() {
++	if (exiting || Scene::instance.get() != this) {
++		return;
++	}
++
++	// Wait 15 frames (~0.25s) to avoid consuming the button press from Title screen
++	if (wait_frames < 15) {
++		++wait_frames;
++		return;
++	}
++
++	if (Input::IsTriggered(Input::DECISION) ||
++		Input::IsTriggered(Input::CANCEL) ||
++		Input::IsTriggered(Input::SHIFT) ||
++		Input::IsTriggered(Input::UP) ||
++		Input::IsTriggered(Input::DOWN) ||
++		Input::IsTriggered(Input::LEFT) ||
++		Input::IsTriggered(Input::RIGHT)) {
++
++		exiting = true;
++		Main_Data::game_system->SePlay(Main_Data::game_system->GetSystemSE(Main_Data::game_system->SFX_Decision));
++		Scene::Pop();
++		Player::SetupNewGame();
++	}
++}
++
++void Scene_KeyGuide::TransitionIn(SceneType /* prev_scene */) {
++	Transition::instance().InitShow(Transition::TransitionFadeIn, this, 30);
++}
++
++void Scene_KeyGuide::TransitionOut(SceneType /* next_scene */) {
++	Transition::instance().InitErase(Transition::TransitionFadeOut, this, 30);
++}
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_keyguide.h work/src/easyrpg-player-0.8.1.1/src/scene_keyguide.h
+--- vendor/easyrpg-player-0.8.1.1/src/scene_keyguide.h	1970-01-01 08:00:00.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_keyguide.h	2026-11-03 04:31:16.099886000 +0800
+@@ -0,0 +1,51 @@
++/*
++ * This file is part of EasyRPG Player.
++ *
++ * EasyRPG Player is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * EasyRPG Player is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with EasyRPG Player. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef EP_SCENE_KEYGUIDE_H
++#define EP_SCENE_KEYGUIDE_H
++
++// Headers
++#include "async_handler.h"
++#include "scene.h"
++#include "sprite.h"
++
++struct FileRequestResult;
++
++/**
++ * Scene Key Guide class.
++ * Displays the Nintendo Switch controller operation guide screen before the game starts.
++ */
++class Scene_KeyGuide : public Scene {
++public:
++	Scene_KeyGuide();
++
++	void Start() override;
++	void vUpdate() override;
++	void DrawBackground(Bitmap& dst) override;
++	void TransitionIn(SceneType prev_scene) override;
++	void TransitionOut(SceneType next_scene) override;
++
++private:
++	void OnGraphicReady(FileRequestResult* result);
++
++	std::unique_ptr<Sprite> background;
++	FileRequestBinding request_id;
++	int wait_frames = 0;
++	bool exiting = false;
++};
++
++#endif
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_language.cpp work/src/easyrpg-player-0.8.1.1/src/scene_language.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene_language.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_language.cpp	2026-11-09 20:39:54.248854600 +0800
+@@ -169,6 +169,20 @@
+ void Scene_Language::ChangeLanguage(const std::string& lang_str) {
+ 	Main_Data::game_system->SePlay(Main_Data::game_system->GetSystemSE(Main_Data::game_system->SFX_Decision));
+ 
++	// Persist the user's explicit language preference
++	Player::player_config.language.Set(lang_str);
++	auto cfg_out = Game_Config::GetGlobalConfigFileOutput();
++	if (cfg_out) {
++		Game_Config cfg;
++		cfg.video = DisplayUi->GetConfig();
++		cfg.audio = Audio().GetConfig();
++		cfg.input = Input::GetInputSource()->GetConfig();
++		cfg.player = Player::player_config;
++		cfg.WriteToStream(cfg_out);
++		cfg_out.Close();
++		AsyncHandler::SaveFilesystem();
++	}
++
+ 	// No-op?
+ 	if (lang_str == Player::translation.GetCurrentLanguage().lang_dir) {
+ 		PopOrTitle();
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_save.cpp work/src/easyrpg-player-0.8.1.1/src/scene_save.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene_save.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_save.cpp	2026-11-03 01:48:29.332189600 +0800
+@@ -87,7 +87,9 @@
+ 		return false;
+ 	}
+ 
+-	return Save(save_stream, slot_id, prepare_save);
++	bool res = Save(save_stream, slot_id, prepare_save);
++	save_stream.Close();
++	return res;
+ }
+ 
+ bool Scene_Save::Save(std::ostream& os, int slot_id, bool prepare_save) {
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_settings.cpp work/src/easyrpg-player-0.8.1.1/src/scene_settings.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene_settings.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_settings.cpp	2026-11-03 01:48:31.530354800 +0800
+@@ -668,6 +668,7 @@
+ 	cfg.player = Player::player_config;
+ 
+ 	cfg.WriteToStream(cfg_out);
++	cfg_out.Close();
+ 
+ 	AsyncHandler::SaveFilesystem();
+ 
+diff -urN vendor/easyrpg-player-0.8.1.1/src/scene_title.cpp work/src/easyrpg-player-0.8.1.1/src/scene_title.cpp
+--- vendor/easyrpg-player-0.8.1.1/src/scene_title.cpp	2025-06-02 18:35:38.000000000 +0800
++++ work/src/easyrpg-player-0.8.1.1/src/scene_title.cpp	2026-11-03 04:31:34.933245400 +0800
+@@ -24,6 +24,7 @@
+ #include "scene_settings.h"
+ #include "scene_title.h"
+ #include "scene_language.h"
++#include "scene_keyguide.h"
+ #include "audio.h"
+ #include "audio_secache.h"
+ #include "cache.h"
+@@ -119,7 +120,7 @@
+ }
+ 
+ void Scene_Title::Suspend(Scene::SceneType scene_type) {
+-	if (scene_type == Scene::Settings || scene_type == Scene::LanguageMenu) {
++	if (scene_type == Scene::Settings || scene_type == Scene::LanguageMenu || scene_type == Scene::KeyGuide) {
+ 		restart_title_cache = true;
+ 	}
+ 
+@@ -284,9 +285,10 @@
+ 	if (!CheckValidPlayerLocation()) {
+ 		Output::Warning("The game has no start location set.");
+ 	} else {
+-		Output::Debug("Starting new game");
++		Output::Debug("Starting new game with key guide");
+ 		Main_Data::game_system->SePlay(Main_Data::game_system->GetSystemSE(Main_Data::game_system->SFX_Decision));
+-		Player::SetupNewGame();
++		Main_Data::game_system->BgmFade(800, true);
++		Scene::Push(std::make_shared<Scene_KeyGuide>());
+ 	}
+ }
+ 
